@@ -2,10 +2,11 @@
 
 Removes trust in the compromised eMudhra intermediate CA certificates.
 
-**Supported systems:** Ubuntu/Debian · RHEL/CentOS/Rocky/Alma/Fedora · Arch Linux · **macOS**
+**Supported systems:** Ubuntu/Debian · RHEL/CentOS/Rocky/Alma/Fedora · Arch Linux · **macOS** · **Docker containers**
 
 ```
 sudo ./fix-emudhra.sh --check | --fix | --revert  --host ubuntu|redhat|arch|macos
+sudo ./fix-emudhra.sh --check | --fix | --revert  --docker [CONTAINER...]
 ```
 
 Advisory: https://emudhra.we-have-a-problem.com/
@@ -33,7 +34,8 @@ The intermediates chain to two roots:
 
 1. **Tests** whether the machine trusts the compromised chains, by connecting
    to 12 test hosts (one per intermediate, for each root). If every connection
-   is rejected, the machine is safe and the script stops.
+   is rejected, the machine is safe and the script stops. (With `--docker` it
+   scans each container's CA files for the two roots instead.)
 2. **Upgrades** the `ca-certificates` package where that is possible, then tests again.
 3. If the machine is still vulnerable, it **distrusts the two roots** in the
    system trust store, following the advisory's workarounds, and tests a final time.
@@ -54,6 +56,10 @@ sudo ./fix-emudhra.sh --fix --host arch
 sudo ./fix-emudhra.sh --fix --host macos
 
 sudo ./fix-emudhra.sh --revert --host ubuntu    # undo the workaround
+
+sudo ./fix-emudhra.sh --check --docker          # scan all running containers
+sudo ./fix-emudhra.sh --fix --docker web worker # patch the named containers
+sudo ./fix-emudhra.sh --revert --docker web
 ```
 
 ### Flags
@@ -64,6 +70,7 @@ sudo ./fix-emudhra.sh --revert --host ubuntu    # undo the workaround
 | `--fix` | Upgrade, then apply the workaround if still vulnerable. Needs `--host`. |
 | `--revert` | Remove the workaround. Needs `--host`. |
 | `--host TYPE` | The kind of machine. Must match the real OS, or the script refuses to run. |
+| `--docker [CONTAINER...]` | Work on containers (names or IDs; all running ones if none given) instead of the host. Can't be combined with `--host`. |
 | `-h`, `--help` | Show help. |
 
 ### `--host` values
@@ -114,6 +121,46 @@ with an error before anything is changed.
   `/etc/ssl/cert.pem`. It refuses to write an empty file.
 - Revert: restores `/etc/ssl/cert.pem` from the pristine copy.
 
+### Docker containers (`--docker`)
+
+Every container has its own CA store, separate from the host's. `--docker` patches
+it from the outside using only `docker cp`, so it works on any Linux image (Debian,
+Ubuntu, Alpine, RHEL/Fedora, distroless) and on stopped containers. Nothing has to
+be installed inside the container. It needs Docker access (root or the `docker`
+group) and `openssl` on the host.
+
+- Check: copies out every CA file the container's TLS libraries read and looks for
+  the two roots by SHA-256 fingerprint. It follows symlinks inside the container.
+  Files checked:
+  - the bundle files Go and OpenSSL use (`/etc/ssl/certs/ca-certificates.crt`,
+    `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, …);
+  - the hashed cert directories (`/etc/ssl/certs`, `/etc/pki/tls/certs`);
+  - RHEL's other extracted bundles, including `BEGIN TRUSTED CERTIFICATE` ones.
+
+  This is a static check, not a network test. It covers distroless images, which have
+  no `curl`. Exit code `1` if any container is vulnerable.
+- Upgrade: none. Rebuilding on a patched base image is the real fix.
+- Workaround:
+  - Removes the two roots from every affected file, keeping each file's mode.
+  - Files that held only one of the roots are left empty, which breaks their hash links.
+  - On Debian/Ubuntu this includes the source files in `/usr/share/ca-certificates/`,
+    so a later `update-ca-certificates` inside the container doesn't bring the roots back.
+  - On RHEL-family images it also writes the roots to `/etc/pki/ca-trust/source/blocklist/`,
+    so a later `update-ca-trust` keeps them out.
+  - The original files are saved on the host in `/var/backups/fix-emudhra/<container-id>/<timestamp>/`
+    (`~/.local/state/fix-emudhra/` when not run as root; override with `FIX_EMUDHRA_BACKUP`).
+  - Afterwards, restart the container (`docker restart NAME`). Running programs
+    often load CAs only once, at startup.
+- Skipped, with a warning:
+  - containers with a read-only root filesystem (`--read-only`);
+  - files on a bind mount or volume. Fix those at the source on the host.
+- Revert: copies the original files back into the container. `docker cp` can't delete
+  files, so blocklist files the fix created are left empty, which p11-kit ignores.
+
+**The patch only lasts for the life of the container.** `docker restart` keeps it, but
+recreating the container (`docker compose up` after a change, redeploying, a new
+image) starts again from the image. Rebuild your images on an updated base image.
+
 ## Reading the output
 
 ```
@@ -137,8 +184,12 @@ scp fix-emudhra.sh user@host: && ssh -t user@host 'sudo ./fix-emudhra.sh --fix -
   chains go through USERTrust instead and aren't affected. Use `--revert` if something breaks.
 - **Remove the workaround later:** once your OS ships a patched `ca-certificates`,
   run `--revert` and then `--check` to confirm the package update covers it.
-- **Docker containers are not fixed.** Each image has its own CA store. Rebuild
-  containers on updated base images.
-- **Other bundled CA stores** (Python `certifi`, Node.js, Go, Java, etc.) have their own
-  copies; see the advisory's table of patched versions.
+- **Host runs don't touch containers.** Each image has its own CA store. Use `--docker`
+  as a stopgap and rebuild containers on updated base images.
+- **Other bundled CA stores** (Python `certifi`, Node.js, Java `cacerts`, etc.) have their
+  own copies and aren't changed, on the host or in containers. `--docker` lists any Java
+  keystore it finds. See the advisory's table of patched versions.
 - **Requirements:** `bash` (3.2+ works, so the stock macOS shell is fine), `curl`, root for `--fix`/`--revert`.
+  For `--docker`: `docker`, `openssl` and `tar` on the host, and Docker access instead of root.
+  `--docker` was tested on Linux with GNU tar and Docker; macOS (bsdtar, bash 3.2) and Podman
+  (`DOCKER=podman`) are untested.
